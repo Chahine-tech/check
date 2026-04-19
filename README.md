@@ -91,12 +91,31 @@ Exit code `1` on any regression. Wire it into CI and you're done.
 ## CI (GitHub Actions)
 
 ```yaml
-- uses: astral-sh/setup-uv@v4
-- run: uv sync
-- env:
-    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  run: uv run promptci run
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0  # required for base-ref diff mode
+- uses: chahine-tech/promptci@v0.1
+  with:
+    path: tests/prompts
+    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    base-ref: main
+    github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
+
+On pull requests, the action runs your tests against both `main` and your branch,
+compares them, fails the job on regressions, and posts a summary comment on the PR.
+
+| Input                | Default | Description                                                                      |
+| -------------------- | ------- | -------------------------------------------------------------------------------- |
+| `path`               | `.`     | Test path (file or directory)                                                    |
+| `anthropic-api-key`  | —       | **Required.** Anthropic API key                                                  |
+| `python-version`     | `3.13`  | Python version                                                                   |
+| `base-ref`           |         | Base git ref (e.g. `main`). On PRs, results are compared against this ref        |
+| `threshold`          | `0.05`  | Regression threshold as a fraction (5% by default)                               |
+| `github-token`       |         | When set on `pull_request` events, posts the results as a PR comment             |
+| `fail-on-regression` | `true`  | Fail the job if a regression is detected                                         |
+
+Outputs: `passed`, `failed`, `total-tokens`, `total-cost-usd`, `regressions`.
 
 ## What's in the POC
 

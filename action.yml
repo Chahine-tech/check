@@ -1,0 +1,204 @@
+name: "PromptCI"
+description: "pytest for LLM prompts — run tests, detect regressions, comment on PRs"
+branding:
+  icon: "check-square"
+  color: "purple"
+
+inputs:
+  path:
+    description: "Test path (file or directory)"
+    default: "."
+  python-version:
+    description: "Python version to use"
+    default: "3.13"
+  anthropic-api-key:
+    description: "Anthropic API key (required)"
+    required: true
+  base-ref:
+    description: "Base git ref for regression detection (e.g. main). On pull_request events, tests run on base + head and results are compared."
+    required: false
+  threshold:
+    description: "Regression threshold as a fraction (default 0.05 = 5%)"
+    default: "0.05"
+  github-token:
+    description: "GitHub token for PR comments. When set on pull_request events, the diff summary is posted as a PR comment."
+    required: false
+  fail-on-regression:
+    description: "Fail the job if a regression is detected (default true)"
+    default: "true"
+
+outputs:
+  passed:
+    description: "Number of tests that passed"
+    value: ${{ steps.summary.outputs.passed }}
+  failed:
+    description: "Number of tests that failed"
+    value: ${{ steps.summary.outputs.failed }}
+  total-tokens:
+    description: "Total tokens used across all tests"
+    value: ${{ steps.summary.outputs.total_tokens }}
+  total-cost-usd:
+    description: "Total cost in USD across all tests"
+    value: ${{ steps.summary.outputs.total_cost_usd }}
+  regressions:
+    description: "Number of regressions detected (0 if base-ref not set)"
+    value: ${{ steps.summary.outputs.regressions }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install PromptCI
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        # If the action is used with `uses: ./` from the PromptCI repo itself
+        # (dogfooding or self-test), install from source. Otherwise install from PyPI.
+        if [ -f "$ACTION_PATH/pyproject.toml" ] && grep -q 'name = "promptci"' "$ACTION_PATH/pyproject.toml"; then
+          echo "Installing PromptCI from source at $ACTION_PATH"
+          uv pip install --system "$ACTION_PATH"
+        else
+          echo "Installing PromptCI from PyPI"
+          uv pip install --system promptci
+        fi
+
+    - name: Run on base ref (for diff)
+      if: ${{ inputs.base-ref != '' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        BASE_REF: ${{ inputs.base-ref }}
+      run: |
+        set -e
+        git fetch origin "$BASE_REF" --depth=1
+        HEAD_SHA=$(git rev-parse HEAD)
+        git checkout "origin/$BASE_REF"
+        promptci run "${{ inputs.path }}" --snapshot-dir .promptci/base || true
+        git checkout "$HEAD_SHA"
+
+    - name: Run on head
+      id: run
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+      run: |
+        set -e
+        SNAP_DIR=".promptci/head"
+        if [ -z "${{ inputs.base-ref }}" ] || [ "${{ github.event_name }}" != "pull_request" ]; then
+          SNAP_DIR=".promptci/snapshots"
+        fi
+        promptci run "${{ inputs.path }}" --snapshot-dir "$SNAP_DIR" | tee /tmp/promptci-run.txt
+        echo "snap_dir=$SNAP_DIR" >> "$GITHUB_OUTPUT"
+
+    - name: Diff base vs head
+      id: diff
+      if: ${{ inputs.base-ref != '' && github.event_name == 'pull_request' }}
+      shell: bash
+      run: |
+        set +e
+        promptci diff .promptci/base .promptci/head --threshold ${{ inputs.threshold }} | tee /tmp/promptci-diff.txt
+        echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+    - name: Compute summary outputs
+      id: summary
+      if: always()
+      shell: bash
+      env:
+        SNAP_DIR: ${{ steps.run.outputs.snap_dir }}
+      run: |
+        python - <<'PY' >> "$GITHUB_OUTPUT"
+        import json, os
+        from pathlib import Path
+
+        snap_dir = Path(os.environ.get("SNAP_DIR") or ".promptci/snapshots")
+        snaps = []
+        if snap_dir.is_dir():
+            for p in snap_dir.glob("*.json"):
+                snaps.append(json.loads(p.read_text()))
+
+        passed = sum(1 for s in snaps if s.get("passed"))
+        failed = len(snaps) - passed
+        tokens = sum(s.get("input_tokens", 0) + s.get("output_tokens", 0) for s in snaps)
+        cost = sum(s.get("cost_usd", 0.0) for s in snaps)
+
+        regressions = 0
+        base_dir = Path(".promptci/base")
+        head_dir = Path(".promptci/head")
+        if base_dir.is_dir() and head_dir.is_dir():
+            base_map = {
+                json.loads(p.read_text())["test_id"]: json.loads(p.read_text())
+                for p in base_dir.glob("*.json")
+            }
+            threshold = float(os.environ.get("THRESHOLD", "0.05"))
+            for p in head_dir.glob("*.json"):
+                h = json.loads(p.read_text())
+                b = base_map.get(h["test_id"])
+                if not b:
+                    continue
+                if b.get("passed") and not h.get("passed"):
+                    regressions += 1
+                    continue
+                b_tok = b.get("input_tokens", 0) + b.get("output_tokens", 0)
+                h_tok = h.get("input_tokens", 0) + h.get("output_tokens", 0)
+                if b_tok > 0 and (h_tok - b_tok) / b_tok > threshold:
+                    regressions += 1
+
+        print(f"passed={passed}")
+        print(f"failed={failed}")
+        print(f"total_tokens={tokens}")
+        print(f"total_cost_usd={cost:.4f}")
+        print(f"regressions={regressions}")
+        PY
+
+    - name: Post PR comment
+      if: ${{ inputs.github-token != '' && github.event_name == 'pull_request' }}
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require("fs");
+          const runPath = "/tmp/promptci-run.txt";
+          const diffPath = "/tmp/promptci-diff.txt";
+          const marker = "<!-- promptci -->";
+
+          let body = `${marker}\n## 🧪 PromptCI\n`;
+
+          if (fs.existsSync(runPath)) {
+            const output = fs.readFileSync(runPath, "utf8").trim();
+            if (output) body += `\n\`\`\`\n${output}\n\`\`\`\n`;
+          }
+          if (fs.existsSync(diffPath)) {
+            const diff = fs.readFileSync(diffPath, "utf8").trim();
+            if (diff) body += `\n### Diff vs \`${{ inputs.base-ref }}\`\n\n\`\`\`\n${diff}\n\`\`\`\n`;
+          }
+
+          const { data: comments } = await github.rest.issues.listComments({
+            ...context.repo,
+            issue_number: context.issue.number,
+          });
+          const prev = comments.find((c) => c.body?.startsWith(marker));
+          if (prev) {
+            await github.rest.issues.updateComment({
+              ...context.repo,
+              comment_id: prev.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+          }
+
+    - name: Fail on regression
+      if: ${{ inputs.fail-on-regression == 'true' && steps.diff.outputs.exit_code != '' && steps.diff.outputs.exit_code != '0' }}
+      shell: bash
+      run: |
+        echo "::error::PromptCI detected regressions. See the diff output above."
+        exit 1

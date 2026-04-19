@@ -1,0 +1,27 @@
+name: Example (dogfood)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  prompts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # required for base-ref diff
+
+      - name: Run PromptCI on examples/
+        uses: ./
+        with:
+          path: examples/
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          base-ref: main
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fail-on-regression: "true"
