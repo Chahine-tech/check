@@ -27,7 +27,6 @@ promptci = "promptci.plugin"
 
 [dependency-groups]
 dev = [
-    "pytest-asyncio>=0.23",
     "ruff>=0.6",
     "ty>=0.0.1a1",
 ]
@@ -45,6 +44,3 @@ select = ["E", "F", "I", "N", "UP", "ANN", "ASYNC", "B", "SIM"]
 
 [tool.ty.environment]
 python-version = "3.13"
-
-[tool.pytest.ini_options]
-asyncio_default_fixture_loop_scope = "function"
