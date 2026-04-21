@@ -39,17 +39,10 @@ def run(
         "pytest",
         path,
         f"--pytest-prompts-snapshot-dir={snapshot_dir}",
+        "-v" if verbose else "-q",
     ]
-    if verbose:
-        args.append("-v")
-    else:
-        args.append("-q")
-
     result = subprocess.run(args, check=False)  # noqa: S603
-
-    snapshots = store.all()
-    _print_summary(snapshots)
-
+    _print_summary(store.all())
     raise typer.Exit(code=result.returncode)
 
 
@@ -74,41 +67,27 @@ def diff(
         pytest-prompts diff main --path tests/prompts/
         pytest-prompts diff .snapshots/base .snapshots/head
     """
-    base_is_path = Path(base).exists()
-
-    if base_is_path:
-        # Legacy: both args are snapshot dirs — treat head_dir as second positional
+    if Path(base).exists():
         _diff_dirs(base_dir=base, head_dir=head_dir or settings.snapshot_dir, threshold=threshold)
     else:
         _diff_git_ref(ref=base, test_path=path, threshold=threshold, head_dir=head_dir)
 
 
 def _diff_git_ref(ref: str, test_path: str, threshold: float, head_dir: str) -> None:
-    """Run tests on a git ref, then compare against current snapshot dir."""
-    if not _git_available():
-        console.print("[red]git not found in PATH.[/red]")
-        raise typer.Exit(code=2)
-
-    if not _ref_exists(ref):
-        console.print(f"[red]Git ref not found:[/red] {ref}")
-        raise typer.Exit(code=2)
-
     current_snap = head_dir or settings.snapshot_dir
 
-    # Run head tests first (current working tree)
     console.print(f"\n[bold]Running tests on HEAD[/bold] ({test_path})")
     head_store = SnapshotStore(current_snap)
     _clear_dir(head_store.root)
     _run_pytest(test_path, current_snap, quiet=True)
 
-    head_map = {s.test_id: s for s in head_store.all()}
+    head_map = _snapshot_map(head_store)
     if not head_map:
         console.print(
             "[red]No snapshots after running tests.[/red] Check that tests use @prompt_test."
         )
         raise typer.Exit(code=2)
 
-    # Run base tests in a temporary worktree
     console.print(f"[bold]Running tests on[/bold] {ref}")
     with tempfile.TemporaryDirectory() as tmp:
         base_snap = str(Path(tmp) / "base-snaps")
@@ -130,7 +109,7 @@ def _diff_git_ref(ref: str, test_path: str, threshold: float, head_dir: str) -> 
                 capture_output=True,
             )
 
-        base_map = {s.test_id: s for s in SnapshotStore(base_snap).all()}
+        base_map = _snapshot_map(SnapshotStore(base_snap))
 
     if not base_map:
         console.print(f"[yellow]No snapshots found for ref {ref!r} — nothing to compare.[/yellow]")
@@ -142,8 +121,8 @@ def _diff_git_ref(ref: str, test_path: str, threshold: float, head_dir: str) -> 
 
 
 def _diff_dirs(base_dir: str, head_dir: str, threshold: float) -> None:
-    base_map = {s.test_id: s for s in SnapshotStore(base_dir).all()}
-    head_map = {s.test_id: s for s in SnapshotStore(head_dir).all()}
+    base_map = _snapshot_map(SnapshotStore(base_dir))
+    head_map = _snapshot_map(SnapshotStore(head_dir))
 
     if not base_map:
         console.print(f"[red]No snapshots in baseline:[/red] {base_dir}")
@@ -163,24 +142,15 @@ def _run_pytest(path: str, snapshot_dir: str, cwd: str | None = None, quiet: boo
         f"--pytest-prompts-snapshot-dir={snapshot_dir}",
         "-q" if quiet else "-v",
     ]
-    result = subprocess.run(args, check=False, cwd=cwd)  # noqa: S603
-    return result.returncode
+    return subprocess.run(args, check=False, cwd=cwd).returncode  # noqa: S603
 
 
-def _git_available() -> bool:
-    try:
-        subprocess.run(["git", "--version"], capture_output=True, check=True)  # noqa: S603
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
+def _snapshot_map(store: SnapshotStore) -> dict[str, Snapshot]:
+    return {s.test_id: s for s in store.all()}
 
 
-def _ref_exists(ref: str) -> bool:
-    result = subprocess.run(  # noqa: S603
-        ["git", "rev-parse", "--verify", ref],
-        capture_output=True,
-    )
-    return result.returncode == 0
+def _percent_change(base: float, head: float) -> float:
+    return (head - base) / base * 100
 
 
 def _clear_dir(path: Path) -> None:
@@ -219,12 +189,11 @@ def _print_summary(snapshots: list[Snapshot]) -> None:
 
     console.print()
     console.print(table)
-    summary = (
+    console.print(
         f"[bold]{passed}[/bold] passed, "
         f"[bold]{failed}[/bold] failed — "
         f"{total_tokens} tokens total — ${total_cost:.4f}"
     )
-    console.print(summary)
 
 
 def _compute_regressions(
@@ -240,25 +209,21 @@ def _compute_regressions(
         if b.passed and not h.passed:
             regressions.append((test_id, "pass → fail"))
             continue
-        # Judge regression: verdict true → false
-        b_verdicts = [j.get("verdict") for j in (b.judge_calls or [])]
-        h_verdicts = [j.get("verdict") for j in (h.judge_calls or [])]
-        for i, (bv, hv) in enumerate(zip(b_verdicts, h_verdicts, strict=False)):
-            if bv is True and hv is False:
-                criterion = (h.judge_calls or [])[i].get("criterion", "")
-                regressions.append((test_id, f"judge verdict false: {criterion}"))
+        for bj, hj in zip(b.judge_calls, h.judge_calls, strict=False):
+            if bj.verdict is True and hj.verdict is False:
+                regressions.append((test_id, f"judge verdict false: {hj.criterion}"))
                 break
         else:
             base_tokens = b.input_tokens + b.output_tokens
             head_tokens = h.input_tokens + h.output_tokens
-            if base_tokens > 0 and (head_tokens - base_tokens) / base_tokens > threshold:
-                pct = (head_tokens - base_tokens) / base_tokens * 100
+            if base_tokens > 0 and _percent_change(base_tokens, head_tokens) > threshold * 100:
+                pct = _percent_change(base_tokens, head_tokens)
                 regressions.append(
                     (test_id, f"tokens {base_tokens} → {head_tokens} (+{pct:.0f}%)")
                 )
                 continue
-            if b.latency_ms > 0 and (h.latency_ms - b.latency_ms) / b.latency_ms > threshold:
-                pct = (h.latency_ms - b.latency_ms) / b.latency_ms * 100
+            if b.latency_ms > 0 and _percent_change(b.latency_ms, h.latency_ms) > threshold * 100:
+                pct = _percent_change(b.latency_ms, h.latency_ms)
                 regressions.append(
                     (test_id, f"latency {b.latency_ms}ms → {h.latency_ms}ms (+{pct:.0f}%)")
                 )
@@ -309,9 +274,8 @@ def _print_diff(
 def _cell(s: Snapshot | None) -> str:
     if s is None:
         return "-"
-    status = "✓" if s.passed else "✗"
     tokens = s.input_tokens + s.output_tokens
-    return f"{status} {tokens}t {s.latency_ms}ms"
+    return f"{'✓' if s.passed else '✗'} {tokens}t {s.latency_ms}ms"
 
 
 if __name__ == "__main__":

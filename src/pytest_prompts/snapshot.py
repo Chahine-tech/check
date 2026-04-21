@@ -5,6 +5,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from pytest_prompts.runner import JudgeResult, RunResult
 
@@ -24,7 +25,7 @@ class Snapshot:
     cost_usd: float
     timestamp: float
     error: str | None = None
-    judge_calls: list[dict[str, object]] = field(default_factory=list)
+    judge_calls: list[JudgeResult] = field(default_factory=list)
 
     @classmethod
     def from_result(
@@ -47,11 +48,42 @@ class Snapshot:
             cost_usd=result.cost_usd,
             timestamp=time.time(),
             error=error,
-            judge_calls=[asdict(j) for j in (judge_calls or [])],
+            judge_calls=list(judge_calls or []),
         )
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False, indent=2)
+        data = asdict(self)
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Snapshot:
+        raw_calls = data.get("judge_calls", [])
+        judge_calls: list[JudgeResult] = [
+            JudgeResult(
+                verdict=bool(c["verdict"]),
+                reasoning=str(c["reasoning"]),
+                criterion=str(c["criterion"]),
+                input_tokens=int(c["input_tokens"]),  # type: ignore[arg-type]
+                output_tokens=int(c["output_tokens"]),  # type: ignore[arg-type]
+                cost_usd=float(c["cost_usd"]),  # type: ignore[arg-type]
+            )
+            for c in (raw_calls if isinstance(raw_calls, list) else [])
+            if isinstance(c, dict)
+        ]
+        return cls(
+            test_id=str(data["test_id"]),
+            passed=bool(data["passed"]),
+            model=str(data["model"]),
+            prompt_hash=str(data["prompt_hash"]),
+            output=str(data["output"]),
+            input_tokens=int(data["input_tokens"]),  # type: ignore[arg-type]
+            output_tokens=int(data["output_tokens"]),  # type: ignore[arg-type]
+            latency_ms=int(data["latency_ms"]),  # type: ignore[arg-type]
+            cost_usd=float(data["cost_usd"]),  # type: ignore[arg-type]
+            timestamp=float(data["timestamp"]),  # type: ignore[arg-type]
+            error=str(data["error"]) if data.get("error") is not None else None,
+            judge_calls=judge_calls,
+        )
 
 
 def _safe_filename(test_id: str) -> str:
@@ -76,7 +108,7 @@ class SnapshotStore:
         if not path.is_file():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        return Snapshot(**data)
+        return Snapshot.from_dict(data)
 
     def all(self) -> list[Snapshot]:
         if not self.root.is_dir():

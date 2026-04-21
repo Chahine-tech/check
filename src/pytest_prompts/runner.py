@@ -66,15 +66,34 @@ _JUDGE_SYSTEM = (
 
 
 def _parse_judge_response(text: str) -> tuple[bool, str]:
-    verdict = False
-    reasoning = text.strip()
+    """Extract verdict and reasoning from judge response.
+
+    Accepts the structured format (VERDICT:/REASON:) but falls back gracefully:
+    - if no VERDICT line, scans for YES/NO anywhere in the text
+    - if no REASON line, uses the full response as reasoning
+    """
+    verdict: bool | None = None
+    reasoning: str | None = None
+
     for line in text.splitlines():
-        line = line.strip()
-        if line.upper().startswith("VERDICT:"):
-            verdict = "YES" in line.upper()
-        elif line.upper().startswith("REASON:"):
-            reasoning = line.split(":", 1)[-1].strip()
-    return verdict, reasoning
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("VERDICT:"):
+            value = stripped[len("VERDICT:"):].strip().upper()
+            verdict = value.startswith("YES")
+        elif upper.startswith("REASON:"):
+            reasoning = stripped[len("REASON:"):].strip()
+
+    if verdict is None:
+        upper_text = text.upper()
+        if "YES" in upper_text:
+            verdict = True
+        elif "NO" in upper_text:
+            verdict = False
+        else:
+            verdict = False
+
+    return verdict, reasoning or text.strip()
 
 
 class Runner:
